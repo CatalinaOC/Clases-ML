@@ -1,0 +1,787 @@
+---
+title: "Sesión 1: Fundamentos de R y datos de calidad del aire"
+subtitle: "Diplomado de Gestión de Calidad del Aire y Control de Contaminación Atmosférica | Modelos de pronóstico"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    df_print: paged
+lang: es
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.2)
+```
+
+# Plan de la sesión
+
+Este documento reúne en un solo lugar la **teoría**, el **código** y los
+**ejercicios** de la sesión. Se trabaja de arriba hacia abajo: se lee el
+texto, se ejecuta cada bloque de código (`Ctrl + Enter` línea a línea o
+`Ctrl + Shift + Enter` bloque completo) y se interpreta el resultado.
+
+| Bloque | Contenido                                             | Duración |
+|--------|-------------------------------------------------------|----------|
+| 1      | Marco general y ciclo de vida de un proyecto de datos | 20 min   |
+| 2      | R, RStudio, proyectos reproducibles y `renv`          | 25 min   |
+| 3      | Los datos: PM2.5 y meteorología                       | 20 min   |
+| Pausa  |                                                       | 10 min   |
+| 4      | Lectura y transformación con `tidyverse`              | 40 min   |
+| 5      | Funciones, unión de datos y guardado                  | 30 min   |
+| 6      | Exploración con `group_by`, `summarise` y `ggplot2`   | 25 min   |
+| 7      | Ejercicios y cierre                                   | 10 min   |
+
+**Objetivos de aprendizaje**
+
+-   [ ] Explicar las etapas del ciclo de vida de un proyecto de data
+    science ambiental.
+-   [ ] Organizar un proyecto reproducible (`.Rproj`, carpetas, rutas
+    relativas, `renv`).
+-   [ ] Leer archivos de calidad del aire con `readr` y construir fechas
+    con `lubridate`.
+-   [ ] Transformar datos con `dplyr` (`select`, `filter`, `mutate`,
+    `rename`, `group_by`, `summarise`) encadenando pasos con el pipe.
+-   [ ] Unir PM2.5 y meteorología en una sola tabla y guardarla en
+    formato RDS.
+-   [ ] Escribir una función simple para no repetir código.
+-   [ ] Describir el ciclo diario y estacional del PM2.5 a partir de los
+    datos.
+
+------------------------------------------------------------------------
+
+# Marco general
+
+## ¿Por qué ciencia de datos en calidad del aire?
+
+Una estación de monitoreo genera un registro por hora, todos los días, de
+varios contaminantes y variables meteorológicas. Al cabo de unos años, una
+sola estación acumula decenas de miles de filas por variable (en este
+curso, más de 140.000). Revisar esa información a mano no escala, y es
+justamente ahí donde las herramientas de programación reproducible, la
+estadística y el *machine learning* (ML) aportan valor:
+
+-   detectar **errores instrumentales** y datos faltantes de forma
+    sistemática;
+-   describir **patrones** horarios, semanales y estacionales;
+-   **explicar** qué condiciones meteorológicas se asocian a
+    concentraciones altas;
+-   **anticipar** episodios críticos para apoyar decisiones de gestión.
+
+> **Idea clave.** El ML no reemplaza a los modelos determinísticos de
+> dispersión ni al criterio experto: los complementa. En la Sesión 3
+> discutiremos cuándo conviene cada enfoque.
+
+## Ciclo de vida de un proyecto de data science ambiental
+
+Un proyecto de datos no es "correr un modelo". Es un ciclo con etapas
+bien diferenciadas, que se repite a medida que se aprende de los
+resultados:
+
+| Etapa                            | Pregunta guía                                                       | Sesión |
+|----------------------------------|---------------------------------------------------------------------|--------|
+| 1\. Definición del problema      | ¿Qué se quiere predecir o explicar, con qué horizonte y para quién? | 1      |
+| 2\. Adquisición de datos         | ¿De dónde vienen los datos y con qué nivel de validación?           | 1      |
+| 3\. Limpieza y control de calidad | ¿Hay faltantes, errores instrumentales o valores atípicos?         | 2      |
+| 4\. Análisis exploratorio        | ¿Qué patrones temporales y relaciones existen?                      | 1 y 2  |
+| 5\. Preparación de variables     | ¿Qué variables ayudan realmente al modelo?                          | 2      |
+| 6\. Modelamiento                 | ¿Qué algoritmo y con qué parámetros?                                | 3      |
+| 7\. Evaluación                   | ¿Generaliza a datos que no vio? ¿Supera a una línea base simple?    | 3      |
+| 8\. Comunicación y mantenimiento | ¿Cómo se documenta, se entrega y se actualiza?                      | 3      |
+
+> **Idea clave.** La mayor parte del esfuerzo real está en las etapas 2 a
+> 5. Un algoritmo sofisticado sobre datos mal preparados entrega
+> resultados poco confiables ("basura entra, basura sale").
+
+**Caso que usaremos en todo el curso:** clasificar y predecir la
+concentración horaria de PM2.5 en la estación **Parque O'Higgins**
+(Santiago) a partir de variables meteorológicas y de calendario.
+
+------------------------------------------------------------------------
+
+# R, RStudio y reproducibilidad
+
+## R y RStudio
+
+-   **R** es el lenguaje y entorno de software libre para computación
+    estadística y gráficos.
+-   **RStudio** es el entorno de desarrollo (IDE) que facilita trabajar
+    con R: editor de código, consola, panel de objetos, gráficos y
+    gestión de paquetes.
+-   **Posit Cloud** permite usar RStudio desde el navegador sin instalar
+    nada, útil para enseñar y colaborar.
+
+## Estructura de un proyecto reproducible
+
+Un análisis es **reproducible** cuando otra persona (o usted mismo dentro
+de seis meses) puede repetirlo desde los datos crudos y obtener los mismos
+resultados. La base es una estructura de carpetas ordenada:
+
+```
+diplomado-calidad-del-aire/
+├── diplomado-calidad-del-aire.Rproj   # define la raíz del proyecto
+├── data/                              # datos crudos, solo lectura
+├── clase1.Rmd, clase2.Rmd, clase3.Rmd # un documento por etapa
+├── *.rds                              # datos procesados (se regeneran con código)
+└── renv.lock                          # versiones de paquetes (renv)
+```
+
+Reglas prácticas:
+
+1.  **Un proyecto de RStudio (`.Rproj`) por análisis.** Al abrirlo, el
+    directorio de trabajo pasa a ser la carpeta del proyecto.
+2.  **Rutas relativas** (`data/archivo.csv`), nunca absolutas
+    (`C:/Users/...`). Así el proyecto funciona en cualquier computador.
+3.  **Los datos crudos no se modifican.** Todo lo derivado se genera con
+    código.
+4.  **Semilla fija** (`set.seed()`) siempre que haya azar (particiones,
+    muestreos, algoritmos aleatorios).
+5.  **Registrar las versiones de los paquetes** con `renv`.
+
+```{r directorio}
+# Debe apuntar a la carpeta del proyecto
+getwd()
+
+# Archivos crudos disponibles
+list.files("data")
+```
+
+## Paquetes: instalación y carga
+
+Un **paquete** es una colección de funciones, datos y documentación que
+extiende R. Se **instala una sola vez** con `install.packages()` y se
+**carga en cada sesión** con `library()`.
+
+Paquetes que usaremos durante el curso:
+
+| Paquete                      | Uso                                       | Sesión |
+|------------------------------|-------------------------------------------|--------|
+| `tidyverse`                  | Lectura, manipulación y gráficos          | 1 a 3  |
+| `lubridate` (en `tidyverse`) | Fechas y horas                            | 1 a 3  |
+| `zoo`                        | Interpolación de series con faltantes     | 2      |
+| `dbscan`                     | Detección de atípicos multivariados (LOF) | 2      |
+| `bestNormalize`              | Transformaciones (Box-Cox, Yeo-Johnson)   | 2      |
+| `splitTools`                 | Particiones entrenamiento/prueba          | 3      |
+| `rpart`, `rpart.plot`        | Árboles de decisión y su visualización    | 3      |
+| `randomForest`               | Bosques aleatorios                        | 3      |
+
+```{r instalar, eval=FALSE}
+# Ejecutar una sola vez (eval = FALSE evita que se repita al compilar)
+install.packages(c("tidyverse", "zoo", "dbscan", "bestNormalize",
+                   "splitTools", "rpart", "rpart.plot", "randomForest", "gridExtra"))
+```
+
+**`tidyverse`** es un ecosistema de paquetes coherentes para ciencia de
+datos: `readr` (lectura), `dplyr` (manipulación), `tidyr` (ordenar
+tablas), `lubridate` (fechas), `ggplot2` (gráficos), entre otros.
+
+```{r paquetes}
+library(tidyverse)
+```
+
+## Control de versiones de paquetes con `renv`
+
+El problema clásico es "en mi computador funcionaba": el código depende de
+las versiones de los paquetes, y estas cambian. El paquete `renv` resuelve
+esto creando una **biblioteca privada por proyecto** y un archivo
+`renv.lock` que registra qué versión se usó.
+
+```{r renv, eval=FALSE}
+renv::init()      # crea la biblioteca privada del proyecto (una vez)
+renv::snapshot()  # guarda las versiones actuales en renv.lock
+renv::restore()   # otra persona/computador: reinstala esas mismas versiones
+```
+
+> En este curso `renv` se presenta de forma **conceptual**. En proyectos
+> profesionales (por ejemplo, un modelo entregado a un cliente) es una
+> buena práctica que conviene adoptar desde el primer día.
+
+## R Markdown: teoría y código en un mismo documento
+
+Este archivo `.Rmd` combina texto (formato Markdown), fórmulas (LaTeX, por
+ejemplo $z = (x - \mu)/\sigma$) y **bloques de código** (*chunks*). Al
+compilar (`Knit`), R ejecuta los bloques y genera un informe HTML con
+código, tablas y gráficos. Opciones útiles de un bloque: `eval = FALSE`
+(no ejecutar), `echo = FALSE` (ocultar el código), `message = FALSE` y
+`warning = FALSE` (ocultar avisos).
+
+------------------------------------------------------------------------
+
+
+# Los datos: PM2.5 y meteorología
+
+## Material particulado fino (PM2.5)
+
+El **PM2.5** es el material particulado con diámetro aerodinámico menor
+o igual a 2,5 micrómetros. Por su tamaño penetra profundamente en el
+sistema respiratorio, y por eso se regula por sus efectos agudos y
+crónicos en la salud. Se expresa en $\mu g/m^3$ y, en las estaciones
+automáticas, se reporta como **promedio horario**. En la zona centro y
+sur de Chile sus fuentes antrópicas principales están asociadas a la
+combustión de leña para calefacción, el transporte en ruta y los procesos
+industriales, a lo que se suman aerosoles secundarios formados en la
+atmósfera.
+
+> **Referencia normativa.** El D.S. N° 12/2011 del Ministerio del Medio
+> Ambiente establece como norma primaria de PM2.5 un valor de
+> 50 $\mu g/m^3$ en 24 horas (se considera superada cuando el percentil
+> 98 de los promedios diarios de un año excede ese valor) y de
+> 20 $\mu g/m^3$ como concentración anual (promedio trianual). Para
+> 24 horas, los niveles de episodios críticos son: alerta de 80 a 109,
+> preemergencia de 110 a 169 y emergencia desde 170 $\mu g/m^3$. Esta
+> norma se encuentra **en proceso de revisión**: antes de citar cifras
+> en un informe, verifique el estado vigente en el sitio de normas de
+> calidad del aire del Ministerio del Medio Ambiente
+> (normasaire.mma.gob.cl).
+
+## Variables meteorológicas asociadas
+
+La concentración de PM2.5 no depende solo de cuánto se emite, sino de
+**cuánto se dispersa** la contaminación. Por eso las variables
+meteorológicas son los predictores naturales de este problema:
+
+| Variable             | Nombre en el curso | Unidad | Por qué importa                                                                                                                           |
+|----------------------|--------------------|--------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| Temperatura          | `Temp`             | °C     | Está ligada a la estabilidad de la atmósfera: las noches frías favorecen inversiones térmicas que confinan los contaminantes cerca del suelo. También se asocia al uso de calefacción. |
+| Humedad relativa     | `hr`               | %      | Influye en el crecimiento de las partículas por absorción de agua y en la formación de aerosoles secundarios; valores muy altos indican niebla. |
+| Velocidad del viento | `WS`               | m/s    | Controla la ventilación: con viento débil hay poca dilución y se acumulan las emisiones.                                                  |
+| Dirección del viento | `WD`               | grados | Indica **desde dónde sopla** el viento (0 o 360 = norte, 90 = este, 180 = sur, 270 = oeste). Es una variable circular.                    |
+
+> **Variables que no tenemos.** La altura de la capa de mezcla, la
+> radiación solar y la precipitación también son muy relevantes. Cuando
+> un modelo no las incluye, parte de la variabilidad queda sin explicar.
+> Es una limitación que recordaremos al evaluar los modelos.
+
+## Estructura de los archivos
+
+Trabajaremos con la estación **Parque O'Higgins**, con datos horarios
+desde el 1 de enero de 2010 hasta enero de 2026 (el formato corresponde a
+la descarga del SINCA). Hay un archivo por variable:
+
+-   `..._PM25.csv`, `..._HR.csv`, `..._Temp.csv`, `..._WD.csv`,
+    `..._WS.csv`.
+-   Cada uno tiene la fecha en formato `YYMMDD`, la hora en formato
+    `HHMM` y, en el caso de las variables meteorológicas, una sola
+    columna de valores.
+-   El archivo de **PM2.5** es distinto: trae tres columnas según el
+    **nivel de validación** del dato.
+
+| Columna                  | Significado                                                  |
+|--------------------------|--------------------------------------------------------------|
+| `Registros validados`    | Datos que pasaron el proceso de validación                   |
+| `Registros preliminares` | Datos disponibles que aún no se validan                      |
+| `Registros no validados` | Datos que no pudieron ser validados                          |
+
+> **Buena práctica.** En un trabajo regulatorio (por ejemplo, evaluar el
+> cumplimiento de una norma) se usan **solo datos validados**. En este
+> curso completaremos los faltantes validados con datos preliminares para
+> ganar cobertura, dejando explícito qué se hizo. Toda decisión de este
+> tipo debe quedar documentada.
+
+------------------------------------------------------------------------
+
+# Lectura y transformación con `tidyverse`
+
+## Lectura de archivos CSV
+
+Una de las tareas más frecuentes es leer datos desde archivos. La función
+adecuada depende del formato:
+
+| Función      | Separador de columnas | Separador decimal | Uso típico                               |
+|--------------|-----------------------|-------------------|------------------------------------------|
+| `read_csv()`  | coma (`,`)           | punto (`.`)       | Formato internacional                    |
+| `read_csv2()` | punto y coma (`;`)   | coma (`,`)        | Formato habitual en países hispanohablantes |
+
+Nuestros archivos usan `;` como separador y coma decimal (por ejemplo,
+`67,6665`), por lo que corresponde `read_csv2()`.
+
+> **Recurso útil**: [Data Import Cheat
+> Sheet](https://github.com/rstudio/cheatsheets/blob/main/data-import.pdf).
+
+```{r leer-hr, message=TRUE}
+# Leemos el archivo de humedad relativa (ruta relativa a la carpeta del proyecto)
+hr <- read_csv2("data/datos_100101_260101_HR.csv")
+
+# glimpse() muestra tipos de datos y primeros valores de cada columna
+glimpse(hr)
+```
+
+Observe que aparecen columnas llamadas `...3` y `...4`. Cada línea del
+archivo termina en `;`, por lo que R detecta una **columna final vacía**
+(`...4`), y la columna con los valores no tiene nombre en el encabezado,
+así que R le asigna `...3`. Corregiremos esto al transformar los datos.
+
+## Objetivo de la transformación
+
+1.  **Unificar** las columnas de fecha y hora en una sola.
+2.  **Convertir** esa columna a un formato de fecha-hora reconocible por
+    R.
+3.  **Renombrar** columnas para que tengan nombres claros.
+4.  **Eliminar** las columnas innecesarias.
+
+## Método 1: paso a paso
+
+Hacemos cada transformación por separado, guardando el resultado en `hr`.
+
+```{r hr-paso-a-paso}
+# Paso 1: combinar FECHA y HORA en una sola columna 'date'.
+# paste() une texto; el operador $ accede a una columna de un data frame.
+hr$date <- paste(hr$`FECHA (YYMMDD)`, hr$`HORA (HHMM)`, sep = "_")
+
+# Paso 2: convertir 'date' a fecha-hora.
+# ymd_hm() (paquete lubridate) interpreta "año-mes-día hora:minuto".
+hr$date <- ymd_hm(hr$date)
+
+# Paso 3: renombrar la columna '...3' a 'hr' (nuevo_nombre = nombre_antiguo).
+hr <- rename(hr, hr = `...3`)
+
+# Paso 4: eliminar columnas que ya no necesitamos (el signo - las excluye).
+hr <- select(hr, -c(`...4`, `FECHA (YYMMDD)`, `HORA (HHMM)`))
+
+hr
+```
+
+## Método 2: todo en un solo proceso con el pipe
+
+El **pipe** (`%>%`) pasa el resultado de una función como primer
+argumento de la siguiente. Se lee como "y luego":
+
+-   `x %>% f()` equivale a `f(x)`.
+-   `x %>% f() %>% g()` equivale a `g(f(x))`.
+
+Ventajas: el código se lee de izquierda a derecha como una receta, no
+hace falta guardar objetos intermedios y es más fácil de revisar.
+
+```{r hr-pipe}
+# Volvemos a leer el archivo original (partimos desde cero)
+hr <- read_csv2("data/datos_100101_260101_HR.csv")
+
+hr <- hr %>%
+  mutate(date = paste(`FECHA (YYMMDD)`, `HORA (HHMM)`, sep = "_")) %>%  # une fecha y hora
+  mutate(date = ymd_hm(date)) %>%                                        # convierte a fecha-hora
+  rename(hr = `...3`) %>%                                                # renombra
+  select(-c(`...4`, `FECHA (YYMMDD)`, `HORA (HHMM)`))                    # elimina columnas
+
+hr
+```
+
+**Funciones utilizadas**
+
+-   `mutate()`: crea o modifica columnas.
+-   `rename()`: cambia nombres de columnas.
+-   `select()`: selecciona columnas (o las elimina con `-`).
+-   `ymd_hm()`: convierte texto a fecha-hora (año, mes, día, hora,
+    minuto).
+
+## Verificar siempre el resultado
+
+Una conversión de fechas puede fallar sin que nos demos cuenta (aparecen
+`NA`). Antes de continuar, comprobamos que todo se interpretó bien:
+
+```{r verificar-fechas}
+sum(is.na(hr$date))   # fechas que no se pudieron interpretar (debe ser 0)
+range(hr$date)        # primer y último registro
+nrow(hr)              # número de filas
+```
+
+------------------------------------------------------------------------
+
+
+# Múltiples archivos, funciones y unión de datos
+
+## Repetir código no escala: funciones
+
+Las variables `Temp`, `WD` y `WS` se leen y transforman **exactamente
+igual** que `hr`. Copiar y pegar el mismo bloque varias veces funciona,
+pero es una fuente de errores: si se corrige algo, hay que acordarse de
+corregirlo en todas las copias. La solución es escribir una **función**.
+
+Una función tiene esta estructura:
+
+``` r
+nombre_funcion <- function(argumento1, argumento2) {
+  # instrucciones
+  resultado   # la última expresión es lo que la función devuelve
+}
+```
+
+```{r funcion-lectura}
+# Función que lee un archivo del SINCA con una sola columna de valores
+# archivo: ruta del CSV | nombre: nombre que tendrá la columna de valores
+leer_variable_sinca <- function(archivo, nombre) {
+  read_csv2(archivo, show_col_types = FALSE) %>%
+    mutate(date = ymd_hm(paste(`FECHA (YYMMDD)`, `HORA (HHMM)`, sep = "_"))) %>%
+    rename(!!nombre := 3) %>%      # la columna 3 trae los valores
+    select(all_of(nombre), date)   # conservamos solo valor y fecha
+}
+```
+
+> `!!nombre :=` permite usar el **contenido** de la variable `nombre`
+> (por ejemplo, `"hr"`) como nombre de la columna nueva.
+
+Comprobamos que la función reproduce exactamente lo que hicimos a mano
+con `hr`:
+
+```{r probar-funcion}
+hr_funcion <- leer_variable_sinca("data/datos_100101_260101_HR.csv", "hr")
+all.equal(hr, hr_funcion)   # TRUE = son idénticos
+```
+
+Ahora leemos las tres variables restantes con una línea cada una:
+
+```{r leer-meteorologia}
+Temp <- leer_variable_sinca("data/datos_100101_260112_Temp.csv", "Temp")  # temperatura
+WD   <- leer_variable_sinca("data/datos_100101_260112_WD.csv",   "WD")    # dirección del viento
+WS   <- leer_variable_sinca("data/datos_100101_260112_WS.csv",   "WS")    # velocidad del viento
+```
+
+## PM2.5: un caso especial
+
+El archivo de PM2.5 trae **tres columnas** según el nivel de validación.
+Primero lo leemos y construimos la fecha:
+
+```{r leer-pm25}
+PM25 <- read_csv2("data/datos_100101_260111_PM25.csv")
+
+PM25 <- PM25 %>%
+  mutate(date = paste(`FECHA (YYMMDD)`, `HORA (HHMM)`, sep = "_")) %>%
+  mutate(date = ymd_hm(date))
+```
+
+Antes de decidir cómo combinar las columnas, **cuantificamos** qué hay en
+cada una. Esto es un ejemplo de exploración de datos faltantes:
+
+```{r pm25-validacion}
+PM25 %>%
+  summarise(
+    validados         = sum(!is.na(`Registros validados`)),
+    solo_preliminares = sum(is.na(`Registros validados`) & !is.na(`Registros preliminares`)),
+    solo_no_validados = sum(is.na(`Registros validados`) & is.na(`Registros preliminares`) &
+                              !is.na(`Registros no validados`)),
+    sin_dato          = sum(is.na(`Registros validados`) & is.na(`Registros preliminares`) &
+                              is.na(`Registros no validados`))
+  )
+```
+
+**Funciones utilizadas**
+
+-   `filter()`: conserva solo las filas que cumplen una condición
+    lógica.
+-   `is.na()`: devuelve `TRUE` si el valor es faltante (`NA`).
+-   `!is.na()`: el operador `!` niega; es `TRUE` cuando **sí** hay dato.
+-   `summarise()`: colapsa la tabla en un resumen (aquí, conteos).
+
+Decisión de trabajo: usaremos el dato **validado** y, cuando falte, el
+**preliminar**. Los "no validados" no se incorporan. Para eso usamos
+`if_else()`, que funciona como un "si-entonces-sino":
+
+`if_else(condición, valor_si_verdadero, valor_si_falso)`
+
+```{r pm25-completar}
+PM25 <- PM25 %>%
+  mutate(
+    `Registros validados` = if_else(
+      is.na(`Registros validados`) & !is.na(`Registros preliminares`),  # condición
+      `Registros preliminares`,                                          # si TRUE
+      `Registros validados`                                              # si FALSE
+    )
+  ) %>%
+  rename(PM25 = `Registros validados`) %>%
+  select(-c(`...6`, `FECHA (YYMMDD)`, `HORA (HHMM)`,
+            `Registros preliminares`, `Registros no validados`))
+
+PM25
+```
+
+> Existe una forma más corta de expresar lo mismo:
+> `coalesce(validados, preliminares)` devuelve el primer valor no
+> faltante de cada fila.
+
+## Unión de los conjuntos de datos
+
+Ahora combinamos las cinco tablas en una sola con `left_join()`:
+
+-   Toma **todas las filas** de la tabla de la izquierda.
+-   Busca en la tabla de la derecha las filas con el mismo valor en la
+    columna indicada en `by`.
+-   Agrega las columnas de la derecha; si no hay coincidencia, quedan
+    como `NA`.
+
+```{r union}
+df <- PM25 %>%
+  left_join(hr,   by = "date") %>%
+  left_join(Temp, by = "date") %>%
+  left_join(WD,   by = "date") %>%
+  left_join(WS,   by = "date")
+
+df
+```
+
+Indicar `by = "date"` de forma explícita es más seguro que dejar que R
+adivine por qué columnas unir.
+
+### Controles de calidad de la unión
+
+Una unión mal hecha puede duplicar filas o descuadrar la serie sin
+avisar. Siempre conviene verificar:
+
+```{r verificar-union}
+dim(df)                       # filas y columnas
+anyDuplicated(df$date)        # 0 = no hay fechas repetidas
+
+# Diferencia en horas entre registros consecutivos: debe ser siempre 1
+table(as.numeric(diff(df$date), units = "hours"))
+
+# Porcentaje de datos faltantes por variable
+round(100 * colMeans(is.na(df)), 1)
+```
+
+**Interpretación.** Todas las diferencias son de 1 hora: la serie es
+horaria, continua, sin duplicados y sin saltos por cambio de horario de
+verano. Recuerde que `ymd_hm()` interpreta las horas como UTC por defecto:
+como los datos ya vienen en una escala uniforme, esto es lo deseable para
+analizar el ciclo diario. Si una serie viniera en hora local con cambio de
+horario, aparecerían diferencias de 0 o 2 horas y habría que tratarlas.
+
+La última línea muestra que cada variable tiene un porcentaje distinto de
+datos faltantes. **Abordaremos los faltantes en la Sesión 2.**
+
+## Guardar los datos procesados
+
+Después de limpiar y unir, conviene guardar el resultado para no repetir
+todo el proceso en cada sesión. El formato **RDS** es el formato nativo de
+R para guardar un objeto:
+
+| Ventaja           | Detalle                                                          |
+|-------------------|------------------------------------------------------------------|
+| Velocidad         | Se lee y escribe mucho más rápido que un CSV                     |
+| Tipos de datos    | Conserva fechas, factores y números exactamente como están       |
+| Tamaño            | Suele ocupar menos espacio                                       |
+| Desventaja        | Solo puede leerse desde R (para compartir con otros, usar CSV)   |
+
+```{r guardar}
+# write_rds() guarda el objeto; read_rds() lo recupera
+df %>% write_rds("consolidadosParqueOhiggins.rds")
+
+# Para leerlo más adelante:
+# df <- read_rds("consolidadosParqueOhiggins.rds")
+```
+
+------------------------------------------------------------------------
+
+# Exploración inicial de los datos
+
+Antes de modelar hay que **mirar** los datos. Usaremos tres verbos de
+`dplyr` que se combinan constantemente:
+
+-   `filter()`: elegir filas.
+-   `group_by()`: definir grupos.
+-   `summarise()`: calcular un resumen por grupo.
+
+## Filtrar y ordenar
+
+```{r filtrar}
+# Las 10 horas con mayor concentración de PM2.5
+df %>%
+  filter(!is.na(PM25)) %>%
+  arrange(desc(PM25)) %>%
+  head(10)
+
+# ¿Cuántas horas superaron 80 µg/m3?
+df %>% filter(PM25 > 80) %>% nrow()
+```
+
+## Promedio anual y cobertura de datos
+
+Además del promedio, siempre debemos revisar **cuántos datos válidos**
+respaldan cada cifra. Un promedio anual calculado con pocos datos no es
+representativo.
+
+```{r resumen-anual}
+resumen_anual <- df %>%
+  mutate(anio = year(date)) %>%
+  group_by(anio) %>%
+  summarise(
+    PM25_media  = mean(PM25, na.rm = TRUE),
+    horas       = n(),
+    captura_pct = 100 * mean(!is.na(PM25)),   # % de horas con dato válido
+    .groups = "drop"
+  )
+
+resumen_anual
+```
+
+Observe que 2026 tiene solo unos cientos de horas: es un **año
+incompleto** y no debe compararse con los demás. También hay años con
+menor captura de datos (por ejemplo 2013 y 2014), lo que reduce la
+confianza en su promedio.
+
+```{r grafico-anual}
+resumen_anual %>%
+  filter(anio < 2026) %>%
+  ggplot(aes(x = anio, y = PM25_media)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+  labs(title = "Promedio anual de PM2.5 en Parque O'Higgins",
+       subtitle = "Línea roja: 20 µg/m³ (valor anual de referencia del D.S. 12/2011)",
+       x = "Año", y = "PM2.5 (µg/m³)") +
+  theme_minimal()
+```
+
+> **Cuidado con la comparación normativa.** Este gráfico es exploratorio.
+> La norma anual se evalúa con el promedio trianual de estaciones
+> calificadas, datos validados y criterios de representatividad
+> específicos. No sustituye una evaluación de cumplimiento.
+
+## Ciclo estacional y ciclo diario
+
+Los datos de calidad del aire tienen **patrones temporales** muy marcados.
+Los descubrimos agrupando por mes y por hora del día:
+
+```{r ciclo-mensual}
+df %>%
+  mutate(mes = month(date)) %>%
+  group_by(mes) %>%
+  summarise(PM25 = mean(PM25, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = factor(mes), y = PM25)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "PM2.5 promedio por mes (2010 a 2026)",
+       x = "Mes", y = "PM2.5 (µg/m³)") +
+  theme_minimal()
+```
+
+```{r ciclo-horario}
+df %>%
+  mutate(hora = hour(date)) %>%
+  group_by(hora) %>%
+  summarise(PM25 = mean(PM25, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = hora, y = PM25)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue") +
+  labs(title = "PM2.5 promedio por hora del día",
+       x = "Hora", y = "PM2.5 (µg/m³)") +
+  theme_minimal()
+```
+
+Ambos patrones se ven juntos en un mapa de calor (mes por hora):
+
+```{r mapa-calor}
+df %>%
+  mutate(mes = month(date), hora = hour(date)) %>%
+  group_by(mes, hora) %>%
+  summarise(PM25 = mean(PM25, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = hora, y = factor(mes), fill = PM25)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "magma", direction = -1) +
+  labs(title = "PM2.5 promedio por mes y hora",
+       x = "Hora", y = "Mes", fill = "µg/m³") +
+  theme_minimal()
+```
+
+**Interpretación.**
+
+-   La concentración es mucho mayor en los meses fríos (otoño e
+    invierno) que en primavera y verano. En esa época se combinan mayores
+    emisiones (calefacción) con condiciones meteorológicas que dificultan
+    la dispersión (inversión térmica, poco viento).
+-   Dentro del día hay un máximo en la mañana y un mínimo en la tarde, y
+    la concentración vuelve a subir al anochecer. Refleja el ritmo de las
+    emisiones y la evolución de la capa de mezcla durante el día.
+-   Estos patrones anticipan que **el mes y la hora serán predictores
+    muy informativos**. Los construiremos formalmente en la Sesión 2 y
+    veremos su efecto en los modelos en la Sesión 3.
+
+------------------------------------------------------------------------
+
+# Ejercicios y cierre
+
+## Ejercicio 1 (guiado): percentil 98 de los promedios diarios
+
+La norma de 24 horas se evalúa con el percentil 98 anual de los promedios
+diarios. Con fines didácticos, calcule para cada año:
+
+-   [ ] el promedio diario de PM2.5, exigiendo al menos 18 horas
+    válidas de 24 (75 %) como criterio de representatividad;
+-   [ ] el percentil 98 de esos promedios diarios;
+-   [ ] la cantidad de días con promedio sobre 50 y sobre 80 $\mu g/m^3$.
+
+**Solución de referencia (instructor).**
+
+```{r ejercicio-1}
+diario <- df %>%
+  mutate(fecha = as_date(date)) %>%
+  group_by(fecha) %>%
+  summarise(PM25_24h  = mean(PM25, na.rm = TRUE),
+            n_validas = sum(!is.na(PM25)),
+            .groups = "drop") %>%
+  filter(n_validas >= 18)        # criterio de representatividad diaria
+
+diario %>%
+  mutate(anio = year(fecha)) %>%
+  filter(anio < 2026) %>%
+  group_by(anio) %>%
+  summarise(P98           = quantile(PM25_24h, 0.98),
+            dias_sobre_50 = sum(PM25_24h > 50),
+            dias_sobre_80 = sum(PM25_24h >= 80),
+            .groups = "drop")
+```
+
+## Ejercicio 2 (propuesto)
+
+-   [ ] Repita el gráfico del ciclo horario **separando** verano
+    (diciembre a febrero) e invierno (junio a agosto). Pista: cree una
+    columna con `case_when()` o `if_else()` y agregue `color = estacion`
+    al `aes()`.
+-   [ ] ¿Cambia la forma del ciclo diario entre estaciones? ¿Qué proceso
+    físico o de emisión podría explicarlo?
+
+## Ejercicio 3 (propuesto)
+
+-   [ ] Calcule el promedio de PM2.5 por día de la semana. ¿Existe
+    diferencia entre días laborales y fin de semana?
+-   [ ] Escriba una función `promedio_por(df, columna)` que devuelva el
+    promedio de PM2.5 agrupado por la columna indicada.
+
+## Lista de verificación antes de cerrar
+
+-   [ ] Puedo explicar por qué usamos rutas relativas y un `.Rproj`.
+-   [ ] Sé verificar que las fechas se interpretaron bien.
+-   [ ] Puedo unir tablas con `left_join()` y comprobar que la unión no
+    duplicó filas.
+-   [ ] Tengo el archivo `consolidadosParqueOhiggins.rds` en la carpeta
+    del proyecto (lo necesitaremos en la Sesión 2).
+
+------------------------------------------------------------------------
+
+# Resumen de la sesión
+
+1.  El ciclo de vida de un proyecto de datos tiene etapas; la mayor parte
+    del esfuerzo está en preparar los datos.
+2.  Un proyecto reproducible usa `.Rproj`, rutas relativas, datos crudos
+    intactos, semillas fijas y `renv`.
+3.  `read_csv2()` lee archivos con `;` y coma decimal; `ymd_hm()` crea
+    fechas-hora.
+4.  `mutate()`, `rename()`, `select()`, `filter()`, `group_by()` y
+    `summarise()` encadenados con `%>%` forman el núcleo de la
+    manipulación de datos.
+5.  Una función evita repetir código y reduce errores.
+6.  `left_join()` une tablas por una columna común; siempre se verifica el
+    resultado.
+7.  El PM2.5 tiene un fuerte ciclo estacional y diario, que guiará el
+    modelamiento.
+
+**Para la próxima sesión:** limpieza de datos (faltantes, errores
+instrumentales y valores atípicos) y preparación de variables.
+
+## Lecturas recomendadas
+
+-   Wickham, H., Çetinkaya-Rundel, M. y Grolemund, G. *R for Data
+    Science* (2.ª ed.). Libro en línea de acceso abierto.
+-   Carslaw, D. C. y Ropkins, K. (2012). openair: an R package for air
+    quality data analysis. *Environmental Modelling & Software*, 27-28,
+    52-61.

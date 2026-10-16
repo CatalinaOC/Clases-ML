@@ -1,0 +1,1063 @@
+---
+title: "Sesión 2: Limpieza y preparación de datos de calidad del aire"
+subtitle: "Diplomado de Gestión de Calidad del Aire y Control de Contaminación Atmosférica | Modelos de pronóstico"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    df_print: paged
+lang: es
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.2)
+```
+
+# Plan de la sesión
+
+En la Sesión 1 construimos la tabla consolidada de Parque O'Higgins. Hoy
+la dejamos lista para modelar. Un modelo de machine learning aprende lo
+que le mostramos: si los datos contienen errores instrumentales, huecos
+mal tratados o variables mal construidas, el modelo aprenderá esos
+defectos.
+
+| Bloque | Contenido                                                         | Duración |
+|--------|-------------------------------------------------------------------|----------|
+| 1      | Datos faltantes: diagnóstico y tratamiento                        | 30 min   |
+| 2      | Control de calidad por rangos físicos y valores repetidos         | 25 min   |
+| Pausa  |                                                                   | 10 min   |
+| 3      | Valores atípicos: IQR, Z-score y LOF                              | 45 min   |
+| 4      | Atípicos reales versus eventos ambientales (discusión)            | 15 min   |
+| Pausa  |                                                                   | 10 min   |
+| 5      | Variables temporales y componentes del viento                     | 25 min   |
+| 6      | Normalización y estandarización                                   | 15 min   |
+| 7      | Ejercicio integrador y cierre                                     | 5 min    |
+
+**Objetivos de aprendizaje**
+
+-   [ ] Diagnosticar el patrón de datos faltantes y decidir cómo tratarlos.
+-   [ ] Aplicar reglas de control de calidad basadas en límites físicos.
+-   [ ] Detectar valores atípicos con IQR, Z-score y LOF, y comparar los
+    métodos.
+-   [ ] Distinguir un error instrumental de un evento ambiental real.
+-   [ ] Construir variables temporales y las componentes u y v del viento.
+-   [ ] Elegir una transformación de escala según el modelo y aplicarla
+    sin filtrar información del conjunto de prueba.
+
+Si algún paquete no está instalado en su computador, ejecute primero este
+bloque **una sola vez** (se deja con `eval = FALSE` para que no se repita al
+compilar el documento):
+
+```{r instalar, eval=FALSE}
+install.packages(c("tidyverse", "zoo", "dbscan", "bestNormalize"))
+```
+
+```{r paquetes}
+library(tidyverse)
+library(zoo)            # interpolación de series con huecos
+library(dbscan)         # LOF (Local Outlier Factor)
+library(bestNormalize)  # Box-Cox y Yeo-Johnson
+```
+
+------------------------------------------------------------------------
+
+# Carga de datos
+
+Recuperamos el archivo RDS de la sesión anterior. Al ser RDS, las fechas
+y los tipos de datos llegan tal como los guardamos, sin conversiones.
+
+```{r carga}
+df <- read_rds("consolidadosParqueOhiggins.rds")
+df
+```
+
+------------------------------------------------------------------------
+
+# Datos faltantes
+
+## ¿Por qué importan?
+
+La mayoría de los algoritmos (incluidos `rpart` y `randomForest`) **no
+aceptan `NA`** en las variables que usan, o eliminan esas filas en
+silencio. Antes de decidir qué hacer conviene entender **cuánto** falta y
+**cómo** falta.
+
+Los faltantes se clasifican habitualmente en tres tipos:
+
+| Tipo                                          | Significado                                                            | Ejemplo en una estación                                    |
+|-----------------------------------------------|------------------------------------------------------------------------|------------------------------------------------------------|
+| MCAR (perdidos completamente al azar)         | La ausencia no depende de nada                                         | Falla puntual de comunicación de datos                     |
+| MAR (perdidos al azar condicionado a otras variables) | La ausencia depende de variables que sí observamos              | Más fallas cuando hace mucho frío o humedad                |
+| MNAR (perdidos no al azar)                    | La ausencia depende del propio valor que falta                         | El equipo se satura o se apaga con concentraciones extremas |
+
+Si los faltantes no son aleatorios, eliminar filas puede **sesgar** el
+resultado. Por eso primero se diagnostica.
+
+## Diagnóstico
+
+```{r faltantes-resumen}
+# Porcentaje de faltantes por variable
+df %>%
+  summarise(across(-date, ~ round(100 * mean(is.na(.x)), 1))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_faltante")
+```
+
+Los faltantes cambian entre años. Un modelo entrenado con datos de un
+periodo con muchos huecos puede quedar desbalanceado:
+
+```{r faltantes-anio}
+df %>%
+  mutate(anio = year(date)) %>%
+  group_by(anio) %>%
+  summarise(across(c(PM25, hr, Temp, WD, WS), ~ round(100 * mean(is.na(.x)), 1)),
+            .groups = "drop")
+```
+
+Además de cuánto falta, importa **cuándo termina** cada serie. Una
+variable puede dejar de tener datos al final del periodo (por ejemplo, un
+sensor que sale de servicio o datos que aún no se publican):
+
+```{r ultima-fecha}
+df %>%
+  summarise(across(c(PM25, hr, Temp, WD, WS), ~ max(date[!is.na(.x)]))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "ultimo_dato")
+```
+
+**Interpretación.** La humedad relativa y la dirección del viento dejan de
+tener datos a comienzos de mayo de 2025, mientras que PM2.5, temperatura
+y velocidad del viento continúan. Cualquier modelo que use `hr` o `WD`
+solo podrá entrenarse y evaluarse hasta esa fecha. Detectar esto antes
+de modelar evita conclusiones equivocadas, por ejemplo, evaluar un modelo
+"con meteorología completa" sobre meses que en realidad no la tienen.
+
+## ¿Huecos cortos o largos?
+
+Es la pregunta clave para decidir el tratamiento: un hueco de 1 hora se
+puede reconstruir razonablemente; uno de dos meses, no. Medimos el largo
+de cada racha de `NA` consecutivos en PM2.5:
+
+```{r rachas}
+rachas <- rle(is.na(df$PM25))
+largo_huecos <- rachas$lengths[rachas$values]
+
+c(numero_de_huecos = length(largo_huecos),
+  hasta_3_horas    = sum(largo_huecos <= 3),
+  de_4_a_23_horas  = sum(largo_huecos > 3 & largo_huecos < 24),
+  desde_24_horas   = sum(largo_huecos >= 24),
+  hueco_maximo     = max(largo_huecos))
+```
+
+Hay muchos huecos cortos, pero **la mayor parte de las horas faltantes
+está en unos pocos huecos largos**. Esto tiene una consecuencia práctica:
+interpolar huecos cortos es útil y seguro, pero **no resuelve** el
+problema de fondo.
+
+## Estrategias de tratamiento
+
+| Estrategia                       | Cuándo usarla                                       | Riesgo                                              |
+|----------------------------------|-----------------------------------------------------|-----------------------------------------------------|
+| Eliminar filas (`na.omit`)       | Pocos faltantes o faltantes al azar                 | Pérdida de datos y posible sesgo                    |
+| Interpolación lineal de huecos cortos | Series continuas, huecos de pocas horas        | Suaviza picos; inadecuada para huecos largos        |
+| Imputar con media o mediana      | Casi nunca en series temporales                     | Distorsiona la varianza y el ciclo diario           |
+| Imputar con un modelo            | Huecos largos con buenas variables auxiliares       | Circularidad si se imputa con el mismo modelo que se evalúa |
+| Dejar el `NA` y documentarlo     | Modelos que lo permiten o análisis descriptivo      | Ninguno, si se declara                              |
+
+**Criterio de este curso:** interpolar linealmente solo huecos de hasta
+**3 horas** y **dejar como faltante** todo lo demás. Pero hay un orden
+correcto: primero se corrigen los errores instrumentales (sección
+siguiente) y **después** se interpola. Si se interpolara antes, un
+valor erróneo contaminaría a sus vecinos.
+
+------------------------------------------------------------------------
+
+
+# Control de calidad por rangos físicos y valores repetidos
+
+## Reglas de validación
+
+Antes de buscar atípicos con estadística, se aplican reglas basadas en
+**conocimiento físico e instrumental**. Son más defendibles que un
+criterio estadístico, porque no dependen de la muestra:
+
+1.  **Rango físico**: la variable no puede salir de límites posibles
+    (por ejemplo, una temperatura de -38 °C en Santiago es imposible).
+2.  **Valor repetido**: un instrumento que entrega exactamente el mismo
+    valor durante muchas horas seguidas suele estar detenido,
+    saturado o congelado ("*flatline*").
+3.  **Consistencia entre variables**: por ejemplo, una velocidad de
+    viento constante en su máximo con dirección fija.
+
+Primero cuantificamos qué ocurre en nuestros datos:
+
+```{r qc-diagnostico}
+# Largo de la racha de valores idénticos que contiene a cada observación
+largo_racha <- function(x) {
+  r <- rle(x)
+  rep(r$lengths, r$lengths)
+}
+
+df_qc <- df %>%     # df_qc es la copia de trabajo; df queda intacto para comparar
+  mutate(racha_hr = largo_racha(hr),
+         racha_WS = largo_racha(WS))
+
+# Cuántas observaciones incumplen cada regla
+tibble(regla = c("Temp menor a -10 °C",
+                 "Humedad relativa mayor a 100 %",
+                 "Humedad relativa idéntica por 12 horas o más",
+                 "WS = 12,5 m/s con WD = 90 grados",
+                 "WS idéntico por 6 horas o más"),
+       n = c(sum(df$Temp < -10, na.rm = TRUE),
+             sum(df$hr > 100, na.rm = TRUE),
+             sum(df_qc$racha_hr >= 12, na.rm = TRUE),
+             sum(df$WS == 12.5 & df$WD == 90, na.rm = TRUE),
+             sum(df_qc$racha_WS >= 6, na.rm = TRUE)))
+```
+
+Miramos los casos con más detalle para entender **qué** son antes de
+decidir:
+
+```{r qc-casos}
+# Temperatura imposible
+df %>% filter(Temp < -10) %>% select(date, Temp, hr)
+
+# Viento constante en 12,5 m/s y 90 grados (valor típico de un sensor con falla)
+df %>% filter(WS == 12.5 & WD == 90) %>% select(date, WS, WD, PM25)
+
+# Humedad exactamente igual a 100 durante muchas horas
+df_qc %>%
+  filter(racha_hr >= 12) %>%
+  group_by(hr, racha_hr) %>%
+  summarise(inicio = min(date), .groups = "drop")
+```
+
+**Interpretación.**
+
+-   Los -38 °C ocurren un solo día de abril de 2010: es un error
+    instrumental evidente.
+-   El viento de 12,5 m/s con dirección de 90° repetido durante horas es
+    característico de un sensor con falla (valor de saturación).
+-   Humedades de 100 % durante 12 a 17 horas seguidas aparecen solo en
+    junio y julio de 2018. La niebla puede producir 100 %, pero una
+    racha tan larga y exacta sugiere sensor saturado. **Se marca, no se
+    elimina automáticamente**: es una decisión que debe tomar la persona
+    a cargo del análisis y documentarla.
+-   Los valores de velocidad idénticos por 6 horas o más corresponden
+    sobre todo a calmas de 0,1 m/s (resolución del instrumento), no a
+    fallas: se revisan pero **no** se anulan.
+-   Humedades apenas sobre 100 % (por ejemplo, 101 % o 104 %) son un
+    error de calibración pequeño y frecuente; se acotan a 100 %.
+
+> **Regla de oro.** Toda corrección debe ser **trazable**: qué regla se
+> aplicó, a cuántos datos, y con qué criterio. Nunca se modifica el
+> archivo crudo.
+
+## Aplicación de las reglas
+
+```{r qc-aplicar}
+df_qc <- df_qc %>%
+  mutate(
+    # Marca previa: viento en valor de saturación con dirección fija
+    viento_falla = !is.na(WS) & !is.na(WD) & WS == 12.5 & WD == 90,
+    # Regla 1: rango físico de temperatura
+    Temp = if_else(Temp < -10, NA_real_, Temp),
+    # Regla 2: humedad relativa acotada a 100 %
+    hr   = pmin(hr, 100),
+    # Regla 3: se anulan velocidad y dirección del viento en esas horas
+    WS   = if_else(viento_falla, NA_real_, WS),
+    WD   = if_else(viento_falla, NA_real_, WD)
+  ) %>%
+  select(-racha_hr, -racha_WS, -viento_falla)
+
+# Registro de lo que se corrigió
+c(Temp_NA_nuevos = sum(is.na(df_qc$Temp)) - sum(is.na(df$Temp)),
+  WS_NA_nuevos   = sum(is.na(df_qc$WS))   - sum(is.na(df$WS)),
+  hr_mayor_100   = sum(df_qc$hr > 100, na.rm = TRUE))
+```
+
+Ahora sí interpolamos los huecos cortos (hasta 3 horas), sobre datos ya
+corregidos:
+
+```{r interpolar}
+variables <- c("PM25", "hr", "Temp", "WS")   # WD se trata aparte (variable circular)
+
+# Guardamos el estado previo para comparar
+antes <- sapply(variables, function(v) sum(is.na(df_qc[[v]])))
+
+for (v in variables) {
+  df_qc[[v]] <- na.approx(df_qc[[v]], maxgap = 3, na.rm = FALSE)
+}
+
+tibble(variable = variables,
+       NA_antes = antes,
+       NA_despues = sapply(variables, function(v) sum(is.na(df_qc[[v]]))))
+```
+
+> **¿Por qué `WD` no se interpola?** La dirección del viento es una
+> variable **circular**: entre 350° y 10° el camino corto pasa por 0°
+> (norte), pero una interpolación lineal pasaría por 180° (sur). Para
+> interpolar direcciones habría que trabajar con las componentes u y v
+> (véase la sección sobre componentes u y v).
+
+**Interpretación.** La interpolación de huecos cortos recupera pocas
+horas, porque casi todo lo que falta está en huecos largos. Aun así,
+conviene hacerla: evita perder filas completas por una sola hora sin dato
+en alguna variable meteorológica.
+
+------------------------------------------------------------------------
+
+
+# Valores atípicos (outliers)
+
+## ¿Qué es un valor atípico?
+
+Un valor atípico es una observación **inusual respecto del resto**. Esa
+palabra, "inusual", no dice si es un error o un fenómeno real. Un método
+estadístico solo **señala candidatos**; la decisión de conservar, corregir
+o eliminar es del analista. Los métodos se dividen en:
+
+-   **Univariados**: miran una variable a la vez (IQR, Z-score).
+-   **Multivariados**: miran la combinación de variables (LOF). Un punto
+    puede ser normal en cada variable por separado y raro en conjunto
+    (por ejemplo, 30 °C con humedad de 90 %).
+
+## Método 1: rango intercuartílico (IQR)
+
+El IQR (o RIC, rango intercuartílico) es la distancia entre el tercer
+cuartil ($Q_3$, percentil 75) y el primero ($Q_1$, percentil 25). Un valor
+se considera atípico si está fuera del intervalo:
+
+$$[\,Q_1 - 1{,}5 \cdot RIC,\;\; Q_3 + 1{,}5 \cdot RIC\,]$$
+
+Es un método **no paramétrico**: no supone una distribución determinada.
+Es el mismo criterio con que se dibujan los puntos aislados de un
+diagrama de caja (*boxplot*).
+
+```{r iqr}
+Q1  <- quantile(df_qc$PM25, 0.25, na.rm = TRUE)
+Q3  <- quantile(df_qc$PM25, 0.75, na.rm = TRUE)
+RIC <- Q3 - Q1
+
+limite_inferior <- Q1 - 1.5 * RIC
+limite_superior <- Q3 + 1.5 * RIC
+
+c(Q1 = Q1, Q3 = Q3, RIC = RIC, limite_inferior = limite_inferior, limite_superior = limite_superior)
+```
+
+```{r iqr-grafico}
+ggplot(df_qc, aes(y = PM25)) +
+  geom_boxplot(outlier.color = "red", outlier.shape = 19, outlier.alpha = 0.3) +
+  geom_hline(yintercept = c(limite_inferior, limite_superior),
+             linetype = "dashed", color = "blue") +
+  labs(title = "Detección de valores atípicos con IQR",
+       subtitle = paste("Límite inferior:", round(limite_inferior, 1),
+                        "| Límite superior:", round(limite_superior, 1)),
+       y = "PM2.5 (µg/m³)") +
+  theme_minimal()
+```
+
+Marcamos los atípicos en una columna lógica (`TRUE` = atípico). Se revisan
+**ambos** extremos:
+
+```{r iqr-marca}
+df_qc <- df_qc %>%
+  mutate(iqr = PM25 < limite_inferior | PM25 > limite_superior)
+
+table(df_qc$iqr, useNA = "ifany")
+```
+
+### ¿Cuándo se producen esos "atípicos"?
+
+Un criterio global puede engañar cuando la variable tiene un fuerte ciclo
+estacional. Miremos qué porcentaje de los datos marca IQR en cada mes:
+
+```{r iqr-mes}
+df_qc %>%
+  filter(!is.na(PM25)) %>%
+  mutate(mes = month(date)) %>%
+  group_by(mes) %>%
+  summarise(pct_marcado_iqr = round(100 * mean(iqr), 1), .groups = "drop") %>%
+  ggplot(aes(x = factor(mes), y = pct_marcado_iqr)) +
+  geom_col(fill = "firebrick") +
+  labs(title = "Porcentaje de horas marcadas como atípicas por IQR, según mes",
+       x = "Mes", y = "% de horas") +
+  theme_minimal()
+```
+
+**Interpretación.** Casi todos los "atípicos" están entre mayo y agosto.
+No son errores: son el **invierno**, cuando la concentración es
+naturalmente más alta. El IQR calculado con toda la serie compara un
+día de invierno con el promedio de todo el año y lo considera raro.
+Eliminarlos sería borrar justamente los episodios que queremos predecir.
+
+> **Lección.** Un método univariado global es inadecuado si la variable
+> cambia de nivel con la estación. Alternativas: calcular el IQR **por
+> mes**, o buscar atípicos condicionados a las demás variables (LOF).
+
+## Método 2: Z-score
+
+El Z-score mide cuántas desviaciones estándar se aleja un dato de la
+media:
+
+$$z = \frac{x - \mu}{\sigma}$$
+
+Se suele considerar atípico un valor con $|z| > 2$ (o más estricto,
+$|z| > 3$). A diferencia del IQR, **supone una distribución
+aproximadamente simétrica**, y tanto la media como la desviación estándar
+son sensibles a los propios atípicos.
+
+```{r zscore}
+media_pm25 <- mean(df_qc$PM25, na.rm = TRUE)
+desv_pm25  <- sd(df_qc$PM25, na.rm = TRUE)
+
+df_qc <- df_qc %>%
+  mutate(z = (PM25 - media_pm25) / desv_pm25,       # el z-score numérico se conserva
+         z_score = abs(z) > 2)                       # y se marca por separado
+
+table(df_qc$z_score, useNA = "ifany")
+```
+
+### Comparación de ambos métodos
+
+```{r comparar-univariados}
+table(IQR = df_qc$iqr, Z_Score = df_qc$z_score)
+
+c(z_menor_a_menos_2 = sum(df_qc$z < -2, na.rm = TRUE),
+  z_mayor_a_2       = sum(df_qc$z > 2,  na.rm = TRUE))
+```
+
+**Interpretación.** Z-score con umbral 2 marca más datos que IQR, y **todos
+son del extremo alto**: nunca hay valores bajo -2, porque el PM2.5 tiene
+una cola larga a la derecha (asimetría positiva) y un piso en cero. Como
+la distribución no es simétrica, el criterio de "±2 desviaciones" pierde
+sentido. Esto ilustra por qué elegir el método exige conocer la
+distribución de la variable.
+
+## Método 3: LOF (Local Outlier Factor)
+
+### Idea
+
+Los métodos anteriores miran una variable a la vez. **LOF** mira varias
+al mismo tiempo y compara la **densidad local** de cada punto con la de
+sus vecinos:
+
+-   Para cada punto se buscan sus $k$ vecinos más cercanos (el parámetro
+    `minPts`).
+-   Se estima qué tan "apretada" es la zona donde está el punto.
+-   El LOF es el cociente entre la densidad de sus vecinos y la suya
+    propia.
+
+Interpretación del valor:
+
+| LOF             | Lectura                                                        |
+|-----------------|----------------------------------------------------------------|
+| Cercano a 1     | El punto está en una zona tan densa como sus vecinos (normal)  |
+| Mayor que 1     | El punto está más aislado que sus vecinos                      |
+| Mucho mayor que 1 (por ejemplo, > 2) | Candidato a atípico multivariado           |
+
+Como LOF usa **distancias**, las variables deben estar en **la misma
+escala**; si no, la de mayor magnitud domina. Por eso se estandarizan
+antes con `scale()`.
+
+### Aplicación
+
+Usamos PM2.5, humedad, temperatura y velocidad del viento, solo en las
+filas completas:
+
+```{r lof}
+vars_lof <- c("PM25", "hr", "Temp", "WS")
+
+lof_datos <- df_qc %>%
+  select(date, all_of(vars_lof)) %>%
+  na.omit()
+
+# Estandarización de las variables (media 0, desviación 1) para que pesen igual
+X <- scale(lof_datos[, vars_lof])
+
+# minPts = 20: cada punto se compara con sus 20 vecinos más cercanos
+lof_datos$lof <- lof(X, minPts = 20)
+
+summary(lof_datos$lof)
+```
+
+```{r lof-hist}
+ggplot(lof_datos, aes(x = lof)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 2, color = "red", linetype = "dashed") +
+  scale_y_log10() +
+  labs(title = "Distribución del LOF",
+       subtitle = "Eje vertical en escala logarítmica. Línea roja: LOF = 2",
+       x = "LOF", y = "Frecuencia (escala log)") +
+  theme_minimal()
+```
+
+Los casos con mayor LOF:
+
+```{r lof-top}
+lof_datos %>% arrange(desc(lof)) %>% head(8)
+```
+
+**Interpretación.** Casi todas las observaciones tienen LOF cercano a 1.
+Los puntos con LOF alto son **combinaciones inusuales**: por ejemplo, un
+PM2.5 muy bajo con viento fuerte y calor, o una humedad muy alta con
+temperatura alta, o una humedad muy baja con temperaturas frías. No son
+necesariamente valores extremos en una sola variable.
+
+### La elección de `minPts`
+
+El resultado depende de `minPts`. Con un valor muy pequeño se detectan
+irregularidades locales muy finas; con uno grande, solo estructuras
+mayores. Se recomienda probar varios y ver **qué tan estable** es la
+lista de candidatos:
+
+```{r lof-sensibilidad}
+sapply(c(10, 20, 50), function(k) {
+  l <- lof(X, minPts = k)
+  c(minPts = k, LOF_mayor_a_1.5 = sum(l > 1.5), LOF_mayor_a_2 = sum(l > 2))
+})
+```
+
+### ¿Coinciden IQR y LOF?
+
+```{r lof-vs-iqr}
+lof_datos <- lof_datos %>%
+  left_join(df_qc %>% select(date, iqr), by = "date") %>%
+  mutate(lof_atipico = lof > 1.5)
+
+table(IQR = lof_datos$iqr, LOF = lof_datos$lof_atipico)
+```
+
+**Interpretación.** Casi no hay coincidencia. Eso **no es una
+contradicción**: miden cosas distintas. IQR detecta valores altos de PM2.5
+(en su mayoría, invierno real). LOF detecta combinaciones raras entre
+variables. Un dato con PM2.5 alto en invierno, con poco viento y frío, es
+**coherente** con sus vecinos y por eso LOF no lo marca.
+
+| Método  | Qué detecta                                   | Limitación                                              |
+|---------|-----------------------------------------------|---------------------------------------------------------|
+| IQR     | Valores extremos de una variable              | Ignora estacionalidad y otras variables                 |
+| Z-score | Valores lejos de la media                     | Supone simetría; sensible a los propios atípicos        |
+| LOF     | Combinaciones inusuales de varias variables   | Requiere escalar; depende de `minPts`; lento con muchos datos |
+
+------------------------------------------------------------------------
+
+# Atípicos reales versus eventos ambientales
+
+## El dilema
+
+Si un valor extremo es un **error**, se corrige o se elimina. Si es un
+**evento real**, se conserva, porque es exactamente el fenómeno que un
+modelo de calidad del aire debe aprender. Eliminar los episodios críticos
+produciría un modelo que "funciona muy bien" solo porque nunca ve lo que
+importa.
+
+Preguntas para decidir:
+
+-   [ ] ¿El valor es físicamente posible?
+-   [ ] ¿Las **otras variables** son coherentes con él (viento débil,
+    frío, noche, invierno)?
+-   [ ] ¿El valor **sube y baja gradualmente** (evento) o aparece y
+    desaparece de golpe (falla)?
+-   [ ] ¿Hay repetición exacta de valores (sensor detenido)?
+-   [ ] ¿Se observa en otra estación cercana?
+-   [ ] ¿Hay un evento conocido que lo explique (incendio, fuegos
+    artificiales, evento de leña, actividad industrial)?
+
+## Ejemplo 1: un episodio típico de invierno
+
+El 18 y 19 de junio de 2016 se alcanzaron concentraciones sobre 250
+$\mu g/m^3$:
+
+```{r evento-invierno}
+df_qc %>%
+  filter(date >= as.POSIXct("2016-06-18 00:00", tz = "UTC"),
+         date <= as.POSIXct("2016-06-20 12:00", tz = "UTC")) %>%
+  select(date, PM25, Temp, WS) %>%
+  pivot_longer(-date, names_to = "variable", values_to = "valor") %>%
+  ggplot(aes(x = date, y = valor)) +
+  geom_line(color = "steelblue") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1) +
+  labs(title = "Episodio de junio de 2016", x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+**Lectura.** La concentración sube durante la tarde y la noche, con
+temperaturas bajas y viento cercano a cero, y desciende de forma gradual.
+Es un patrón coherente con un episodio de mala ventilación y alta
+emisión. **Es un valor real: se conserva.**
+
+## Ejemplo 2: un evento poco esperado
+
+El 16 de diciembre de 2022 (**verano**) el PM2.5 pasó de 80 a 262
+$\mu g/m^3$ entre la medianoche y las 6 de la mañana:
+
+```{r evento-verano}
+df_qc %>%
+  filter(date >= as.POSIXct("2022-12-15 12:00", tz = "UTC"),
+         date <= as.POSIXct("2022-12-17 00:00", tz = "UTC")) %>%
+  select(date, PM25, Temp, WS) %>%
+  pivot_longer(-date, names_to = "variable", values_to = "valor") %>%
+  ggplot(aes(x = date, y = valor)) +
+  geom_line(color = "firebrick") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 1) +
+  labs(title = "Evento de diciembre de 2022", x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+**Discusión en grupo.** Es un valor extremo en una estación donde en
+verano lo normal es menos de 20 $\mu g/m^3$.
+
+-   ¿Es físicamente posible? Sí.
+-   ¿Es gradual? Sube durante seis horas y baja durante otras ocho.
+-   ¿Las otras variables lo respaldan? El viento está en calma y la noche
+    es fresca: hay condiciones de poca dispersión.
+
+Un método estadístico **no puede resolver esto**. Para confirmarlo habría
+que consultar otras estaciones de la red y eventos locales (incendio,
+quema, actividad puntual). Un análisis serio deja documentado el valor
+como **evento verificado** o **dato dudoso**, según el resultado.
+
+> **Regla de trabajo del curso.** En PM2.5 **no eliminamos** valores solo
+> por ser altos. Corregimos únicamente errores instrumentales
+> demostrables (sección de control de calidad).
+
+------------------------------------------------------------------------
+
+
+# Tratamiento de datos: variables temporales y viento
+
+## Variables temporales
+
+Los datos de calidad del aire tienen ritmos claros: **diarios** (tráfico,
+calefacción, capa de mezcla), **semanales** (actividad laboral) y
+**estacionales** (frío, ventilación). Un algoritmo no "ve" el calendario
+dentro de una columna de fecha-hora, así que hay que **extraer** esos
+componentes como variables.
+
+Funciones de `lubridate`:
+
+| Función  | Devuelve                                                | Rango |
+|----------|---------------------------------------------------------|-------|
+| `hour()` | Hora del día                                            | 0 a 23 |
+| `wday()` | Día de la semana (con `week_start = 1`: lunes = 1)      | 1 a 7 |
+| `month()`| Mes                                                     | 1 a 12 |
+| `yday()` | Día del año                                             | 1 a 366 |
+
+```{r temporales}
+df_qc <- df_qc %>%
+  mutate(
+    hora          = hour(date),
+    dia_semana    = wday(date, week_start = 1),   # 1 = lunes, ..., 7 = domingo
+    mes           = month(date),
+    dia_del_anio  = yday(date),
+    fin_de_semana = dia_semana >= 6,
+    # Estaciones del hemisferio sur
+    estacion = case_when(mes %in% c(12, 1, 2) ~ "Verano",
+                         mes %in% 3:5         ~ "Otoño",
+                         mes %in% 6:8         ~ "Invierno",
+                         TRUE                 ~ "Primavera")
+  )
+
+df_qc %>% select(date, hora, dia_semana, mes, dia_del_anio, fin_de_semana, estacion) %>% head()
+```
+
+### Variables cíclicas: el problema del "salto"
+
+Las horas 23 y 0 están **a una hora de distancia**, pero como números
+están a 23 unidades. Lo mismo ocurre con diciembre (12) y enero (1). Para
+algoritmos basados en distancias o en combinaciones lineales, esto es un
+problema. La solución es representar la variable como un **punto en un
+círculo** usando seno y coseno:
+
+$$x_{\sin} = \sin\!\left(\frac{2\pi\, x}{P}\right), \qquad x_{\cos} = \cos\!\left(\frac{2\pi\, x}{P}\right)$$
+
+donde $P$ es el periodo (24 para la hora, 12 para el mes). En R,
+`sinpi(2 * x / P)` calcula lo mismo, porque `sinpi(y)` es $\sin(\pi y)$.
+
+```{r ciclicas}
+df_qc <- df_qc %>%
+  mutate(hora_sin = sinpi(2 * hora / 24),
+         hora_cos = cospi(2 * hora / 24),
+         mes_sin  = sinpi(2 * mes / 12),
+         mes_cos  = cospi(2 * mes / 12))
+
+# Comprobación: las 23 h y las 0 h quedan próximas en el círculo
+df_qc %>% filter(hora %in% c(23, 0)) %>% distinct(hora, hora_sin, hora_cos)
+```
+
+> **¿Se necesita esto con árboles?** No siempre. Un árbol puede aprender
+> reglas del tipo "hora entre 6 y 9" y "mes entre 5 y 8" directamente
+> desde la variable numérica, porque solo compara con umbrales. La
+> codificación cíclica es más importante en regresión lineal, redes
+> neuronales o métodos por distancia. Se presenta aquí porque es una
+> práctica estándar y porque permite comparar.
+
+## Componentes u y v del viento
+
+### El problema de la dirección como variable
+
+La dirección del viento se mide en grados, y 1° y 359° son direcciones
+casi iguales pese a estar en extremos de la escala. Además, una dirección
+sin velocidad carece de sentido: con viento en calma la dirección es
+ruidosa (véase el 16 de diciembre de 2022, con velocidades de centésimas
+de m/s y direcciones que saltan). Las **componentes vectoriales** resuelven
+ambos problemas:
+
+-   son continuas y no tienen salto en 360°;
+-   incorporan velocidad y dirección a la vez, de modo que en calma tienden a cero.
+
+### Convención meteorológica
+
+La dirección meteorológica indica **desde dónde sopla** el viento
+(0° = norte, 90° = este, 180° = sur, 270° = oeste). Las componentes se
+definen por hacia dónde **se mueve** el aire:
+
+-   **u (zonal)**: positiva si el aire va hacia el **este** (viento del
+    oeste).
+-   **v (meridional)**: positiva si el aire va hacia el **norte** (viento
+    del sur).
+
+$$u = -WS \cdot \sin(\theta), \qquad v = -WS \cdot \cos(\theta)$$
+
+El signo negativo aparece porque $\theta$ indica de dónde viene, no
+hacia dónde va.
+
+> **Nota sobre la convención.** Algunas fuentes omiten el signo negativo
+> y calculan $u = WS \sin\theta$, $v = WS \cos\theta$. Eso entrega
+> componentes que apuntan **hacia el origen** del viento. Para un modelo
+> de machine learning solo cambia el signo de las variables y el
+> desempeño es el mismo, pero cambia la interpretación física. Lo
+> importante es **elegir una convención y documentarla**.
+
+### Implementación y verificación
+
+Escribimos una función y la probamos con casos cuya respuesta
+conocemos:
+
+```{r viento-funcion}
+agregar_componentes_viento <- function(data, velocidad_col = "WS", direccion_col = "WD") {
+  data %>%
+    mutate(
+      wind_u = -.data[[velocidad_col]] * sinpi(.data[[direccion_col]] / 180),
+      wind_v = -.data[[velocidad_col]] * cospi(.data[[direccion_col]] / 180)
+    )
+}
+
+# Prueba con velocidad 1 m/s y cuatro direcciones conocidas
+tibble(WS = 1, WD = c(0, 90, 180, 270), desde = c("norte", "este", "sur", "oeste")) %>%
+  agregar_componentes_viento() %>%
+  mutate(across(c(wind_u, wind_v), ~ round(.x, 3)))
+```
+
+Lectura: un viento **del norte** (0°) tiene $v = -1$ (el aire va hacia el
+sur); uno **del oeste** (270°) tiene $u = +1$ (el aire va hacia el este).
+Coincide con la definición.
+
+```{r viento-aplicar}
+df_qc <- agregar_componentes_viento(df_qc, velocidad_col = "WS", direccion_col = "WD")
+
+df_qc %>% select(date, WS, WD, wind_u, wind_v) %>% head()
+```
+
+`.data[[nombre]]` permite usar dentro de `mutate()` una columna cuyo
+nombre está guardado en una variable, lo que vuelve reutilizable la
+función. `sinpi()` y `cospi()` calculan el seno y el coseno tomando el
+ángulo como múltiplo de $\pi$: `sinpi(WD / 180)` equivale a
+$\sin(WD \cdot \pi / 180)$, o sea, el seno de la dirección expresada en
+grados.
+
+**Comprobación con los datos.** ¿Cambia el PM2.5 según de dónde sopla el
+viento? Agrupamos las horas con viento apreciable (mayor a 1 m/s) por
+octantes:
+
+```{r viento-octantes}
+df_qc %>%
+  filter(!is.na(WD), WS > 1) %>%
+  mutate(sector = cut((WD + 22.5) %% 360, breaks = seq(0, 360, by = 45),
+                      labels = c("N", "NE", "E", "SE", "S", "SO", "O", "NO"),
+                      include.lowest = TRUE, right = FALSE)) %>%
+  group_by(sector) %>%
+  summarise(PM25_medio = round(mean(PM25, na.rm = TRUE), 1),
+            horas = n(), .groups = "drop")
+```
+
+**Interpretación.** La gran mayoría de las horas con viento apreciable
+sopla del suroeste, con concentraciones relativamente bajas. Los vientos
+del este, oeste y noroeste, mucho menos frecuentes, se asocian a
+concentraciones más altas. La dirección del viento aporta información
+al modelo, y las componentes $u$ y $v$ permiten usarla sin tratar los
+grados como una escala lineal.
+
+------------------------------------------------------------------------
+
+# Normalización y estandarización
+
+## ¿Para qué transformar?
+
+Hay dos propósitos distintos que suelen confundirse:
+
+1.  **Cambiar la forma de la distribución** (por ejemplo, reducir la
+    asimetría): Box-Cox, Yeo-Johnson, logaritmo.
+2.  **Cambiar la escala** sin alterar la forma: estandarización
+    ($z$-score), normalización min-max.
+
+### Asimetría del PM2.5
+
+La concentración de PM2.5 tiene una cola larga a la derecha: muchas horas
+con valores bajos y pocas con valores muy altos. Lo cuantificamos con el
+coeficiente de asimetría (0 = simétrica):
+
+```{r asimetria}
+asimetria <- function(x) {
+  x <- x[!is.na(x)]
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+pm <- df_qc$PM25[!is.na(df_qc$PM25)]
+
+# Box-Cox exige valores estrictamente positivos: hay ceros en PM2.5
+sum(pm <= 0)
+```
+
+Como hay ceros, Box-Cox falla si se aplica directamente. Se puede sumar
+una constante (por ejemplo, 1) o usar Yeo-Johnson, que acepta cualquier
+valor real.
+
+| Método           | Acepta ceros y negativos | Idea                                                                 |
+|------------------|--------------------------|----------------------------------------------------------------------|
+| `log1p(x)`       | Solo $x > -1$            | Logaritmo de $1 + x$; sin parámetros                                 |
+| Box-Cox          | No ($x > 0$)             | Potencia $\lambda$ estimada para acercar a la normalidad             |
+| Yeo-Johnson      | Sí                       | Extensión de Box-Cox                                                 |
+| `asinh(x)`       | Sí                       | Se comporta como logaritmo para valores grandes y como $x$ cerca de 0 |
+
+$$y(\lambda) = \begin{cases}\dfrac{y^\lambda - 1}{\lambda} & \lambda \neq 0 \\[6pt] \log(y) & \lambda = 0\end{cases} \qquad \text{(Box-Cox)}$$
+
+```{r transformaciones}
+bc <- boxcox(pm + 1, standardize = FALSE)        # Box-Cox sobre PM2.5 + 1
+yj <- yeojohnson(pm, standardize = FALSE)         # Yeo-Johnson
+
+tibble(transformacion = c("Original", "log1p", "asinh", "Box-Cox (PM2.5 + 1)", "Yeo-Johnson"),
+       asimetria = c(asimetria(pm), asimetria(log1p(pm)), asimetria(asinh(pm)),
+                     asimetria(predict(bc)), asimetria(predict(yj))))
+
+c(lambda_boxcox = bc$lambda, lambda_yeojohnson = yj$lambda)
+```
+
+```{r transformaciones-graficos}
+tibble(Original = pm, `Yeo-Johnson` = predict(yj), log1p = log1p(pm)) %>%
+  pivot_longer(everything(), names_to = "transformacion", values_to = "valor") %>%
+  mutate(transformacion = factor(transformacion, levels = c("Original", "log1p", "Yeo-Johnson"))) %>%
+  ggplot(aes(x = valor)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  facet_wrap(~ transformacion, scales = "free") +
+  labs(title = "Distribución de PM2.5 antes y después de transformar", x = NULL, y = "Frecuencia") +
+  theme_minimal()
+```
+
+**Interpretación.** Con $\lambda$ cercano a 0 estas transformaciones se
+parecen a un logaritmo: reducen la cola derecha y dejan la distribución
+casi simétrica.
+
+## Estandarización
+
+La estandarización (o $z$-score) resta la media y divide por la desviación
+estándar: $z = (x - \mu)/\sigma$. **No cambia la forma** de la
+distribución, solo la escala. Se usa para que variables con unidades muy
+distintas (por ejemplo, $\mu g/m^3$ y m/s) tengan un peso comparable.
+
+```{r estandarizar}
+x <- df_qc$Temp
+z <- as.numeric(scale(x))          # scale() devuelve una matriz; se convierte a vector
+
+c(media_z = mean(z, na.rm = TRUE), sd_z = sd(z, na.rm = TRUE))
+```
+
+## ¿Cuándo hace falta cada una?
+
+| Modelo                                                | ¿Necesita escalar? | ¿Le ayuda normalizar?                     |
+|-------------------------------------------------------|--------------------|-------------------------------------------|
+| Árboles de decisión, Random Forest                    | **No**             | **No** (solo comparan con umbrales)       |
+| Regresión lineal                                      | No es obligatorio  | Sí, si hay fuerte asimetría o heterocedasticidad |
+| Modelos por distancia (k-vecinos, LOF, k-medias)      | **Sí**             | A veces                                   |
+| SVM, redes neuronales, regresión regularizada (Lasso) | **Sí**             | A veces                                   |
+| PCA                                                   | **Sí**             | A veces                                   |
+
+Los árboles solo usan el **orden** de los valores, y toda transformación
+monótona (creciente) conserva el orden. Por eso **un árbol entrega
+exactamente el mismo resultado con o sin Yeo-Johnson**. En la Sesión 3 lo
+comprobaremos con los datos.
+
+## Regla de oro: ajustar la transformación solo con el conjunto de entrenamiento
+
+Los parámetros de una transformación (la media, la desviación estándar,
+$\lambda$) se **estiman con datos**. Si se estiman con toda la base y
+luego se divide en entrenamiento y prueba, la información del conjunto de
+prueba **se filtra** al proceso de entrenamiento (*data leakage*). El
+procedimiento correcto es:
+
+1.  Dividir primero en entrenamiento y prueba.
+2.  Estimar los parámetros **solo con el entrenamiento**.
+3.  Aplicar esos mismos parámetros al entrenamiento y a la prueba.
+
+```{r fuga-datos}
+# Ejemplo: 70 % inicial de la serie como entrenamiento (partición temporal, ver Sesión 3)
+n_train <- floor(0.7 * nrow(df_qc))
+train_temp <- df_qc$Temp[1:n_train]
+test_temp  <- df_qc$Temp[(n_train + 1):nrow(df_qc)]
+
+# Se estiman media y desviación SOLO con entrenamiento
+mu    <- mean(train_temp, na.rm = TRUE)
+sigma <- sd(train_temp,   na.rm = TRUE)
+
+# Y se aplican a ambos conjuntos
+z_train <- (train_temp - mu) / sigma
+z_test  <- (test_temp  - mu) / sigma
+
+c(media_train = mean(z_train, na.rm = TRUE), media_test = mean(z_test, na.rm = TRUE))
+```
+
+**Interpretación.** El conjunto de prueba queda cerca de 0, pero **no
+exactamente en 0**, y eso es lo correcto: refleja que en la práctica se
+recibirán datos nuevos cuya distribución no conocemos de antemano. Con
+una variable que tenga tendencia o cambio de nivel entre periodos (como
+el PM2.5, que disminuye en los años recientes) la diferencia sería
+mayor.
+
+Con las transformaciones de `bestNormalize` el procedimiento es el mismo:
+se ajusta con `yeojohnson(x_train)` y se aplica a nuevos datos con
+`predict(objeto, newdata = x_test)`.
+
+> **Recordatorio para la variable respuesta.** Si se transforma el PM2.5
+> antes de modelarlo, las métricas (RMSE, MAE) quedan en la escala
+> transformada y **no** en $\mu g/m^3$. Hay que revertir la
+> transformación (`predict(objeto, newdata = pred, inverse = TRUE)`)
+> antes de reportar errores.
+
+------------------------------------------------------------------------
+
+
+# Guardar la base lista para modelar
+
+Conservamos **todas las filas** (no eliminamos observaciones) y las
+variables que usaremos en la Sesión 3. Los faltantes que quedan se
+tratarán al modelar, sin borrar la fila del archivo de trabajo.
+
+```{r guardar}
+df_final <- df_qc %>%
+  select(date, PM25, hr, Temp, WD, WS, wind_u, wind_v,
+         hora, dia_semana, mes, dia_del_anio, fin_de_semana, estacion,
+         hora_sin, hora_cos, mes_sin, mes_cos)
+
+# Mismo nombre de archivo que usa la Sesión 3
+write_rds(df_final, "consolidadosParqueOhigginsv2.rds")
+
+dim(df_final)
+```
+
+Cobertura final de datos completos por año, es decir, filas donde están
+disponibles PM2.5 y las variables meteorológicas que usaremos:
+
+```{r cobertura-final}
+df_final %>%
+  mutate(anio = year(date),
+         completa = !is.na(PM25) & !is.na(hr) & !is.na(Temp) & !is.na(wind_u) & !is.na(wind_v)) %>%
+  group_by(anio) %>%
+  summarise(filas = n(), pct_completas = round(100 * mean(completa), 1), .groups = "drop")
+```
+
+Los años 2025 y 2026 tienen baja cobertura completa por la interrupción de
+`hr` y `WD` que vimos antes, y 2011 y 2013 por huecos largos en varias
+variables. Es información que hay que considerar al elegir el periodo de
+entrenamiento y de prueba.
+
+------------------------------------------------------------------------
+
+# Ejercicio integrador
+
+## Ejercicio 1 (guiado)
+
+Repita el **diagnóstico de calidad** para la variable `Temp` con el
+mismo procedimiento que aplicamos a PM2.5:
+
+-   [ ] Calcule los límites de IQR **por estación del año** (usando
+    `group_by(estacion)`).
+-   [ ] ¿Cambia el porcentaje de datos marcados? ¿Por qué?
+
+**Solución de referencia (instructor).**
+
+```{r ejercicio-1}
+df_final %>%
+  filter(!is.na(Temp)) %>%
+  group_by(estacion) %>%
+  mutate(Q1 = quantile(Temp, 0.25), Q3 = quantile(Temp, 0.75), RIC = Q3 - Q1,
+         atipico = Temp < Q1 - 1.5 * RIC | Temp > Q3 + 1.5 * RIC) %>%
+  summarise(pct_atipicos = round(100 * mean(atipico), 2), .groups = "drop")
+```
+
+## Ejercicio 2 (propuesto)
+
+-   [ ] Aplique LOF usando ahora `PM25`, `Temp`, `wind_u` y `wind_v`.
+    Recuerde **estandarizar** y trabajar solo con filas completas.
+-   [ ] Compare los 10 casos de mayor LOF con los que obtuvimos en clase.
+    ¿Son errores instrumentales o eventos reales? Justifique.
+
+## Ejercicio 3 (propuesto)
+
+-   [ ] Verifique con datos que un viento del **sur** (WD = 180°) y con
+    velocidad 3 m/s da $u \approx 0$ y $v = +3$.
+-   [ ] Redacte, en tres líneas, un **protocolo de control de calidad**
+    para una estación nueva: qué reglas físicas, qué verificaciones de
+    valores repetidos y qué decisión tomaría con los valores extremos.
+
+## Lista de verificación antes de cerrar
+
+-   [ ] Puedo explicar la diferencia entre faltantes MCAR, MAR y MNAR.
+-   [ ] Sé por qué se corrigen errores instrumentales **antes** de
+    interpolar.
+-   [ ] Puedo explicar por qué IQR y LOF marcan datos distintos.
+-   [ ] Sé qué condiciones distinguen un evento real de un error.
+-   [ ] Puedo construir $u$ y $v$ y verificar su signo con casos
+    conocidos.
+-   [ ] Sé que los parámetros de una transformación se estiman solo con
+    el conjunto de entrenamiento.
+-   [ ] Tengo generado `consolidadosParqueOhigginsv2.rds` (lo necesitamos
+    en la Sesión 3).
+
+------------------------------------------------------------------------
+
+# Resumen de la sesión
+
+1.  Los faltantes se diagnostican antes de tratarse. En estos datos casi
+    todas las horas faltantes están en pocos huecos largos, por lo que
+    interpolar huecos de hasta 3 horas recupera pocas filas.
+2.  El control de calidad con **reglas físicas** (rangos, valores
+    repetidos, consistencia) va **primero** y se documenta. Solo después
+    se interpola.
+3.  **IQR** y **Z-score** son univariados y ven solo los valores
+    extremos; en PM2.5 marcan sobre todo el invierno. **LOF** es
+    multivariado y detecta combinaciones inusuales.
+4.  Un método estadístico no distingue entre **error** y **evento real**:
+    esa decisión es del analista, con criterios físicos y contexto.
+5.  Las variables temporales (hora, mes, día de la semana) y las
+    componentes $u$ y $v$ del viento capturan ritmos y dirección de
+    forma útil para el modelo.
+6.  Las transformaciones dependen del modelo: los árboles no las
+    necesitan. Sus parámetros se estiman **solo con el entrenamiento**.
+
+**Para la próxima sesión:** introducción al machine learning, árboles de
+decisión, Random Forest y evaluación de modelos.
+
+## Lecturas recomendadas
+
+-   Breunig, M. M., Kriegel, H.-P., Ng, R. T. y Sander, J. (2000). LOF:
+    identifying density-based local outliers. *ACM SIGMOD Record*, 29(2),
+    93-104.
+-   Box, G. E. P. y Cox, D. R. (1964). An analysis of transformations.
+    *Journal of the Royal Statistical Society B*, 26(2), 211-252.
+-   Yeo, I.-K. y Johnson, R. A. (2000). A new family of power
+    transformations to improve normality. *Biometrika*, 87(4), 954-959.
