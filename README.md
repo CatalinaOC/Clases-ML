@@ -43,7 +43,7 @@ clase. Tardan unos 10 a 15 minutos.
 2. Pegue la dirección del repositorio:
 
    ```
-   https://github.com/TU_USUARIO/NOMBRE_DEL_REPO.git
+   https://github.com/marcelooyaneder/ml-calidad-del-aire-usach.git
    ```
 
 3. Confirme con **OK**. Posit Cloud descargará todos los archivos y abrirá RStudio.
