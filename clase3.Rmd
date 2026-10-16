@@ -254,6 +254,25 @@ Según la variable respuesta, se llama **árbol de clasificación** (clase) o
 **árbol de regresión** (valor numérico; la hoja predice el promedio de
 sus observaciones).
 
+### Aplicaciones
+
+Los árboles de decisión se usan en campos muy distintos: en física, para la
+detección de partículas; en ingeniería biomédica, para identificar
+dispositivos implantables; en análisis financiero, para estudiar la
+satisfacción de clientes; en astronomía, para clasificar estrellas; y en
+medicina, como apoyo al diagnóstico, entre muchas otras aplicaciones.
+
+En calidad del aire, algunos usos habituales son:
+
+-   clasificar horas o días según categorías de calidad del aire o según
+    la ocurrencia de episodios críticos;
+-   identificar **qué condiciones meteorológicas** se asocian a
+    concentraciones altas, a partir de reglas fáciles de comunicar;
+-   apoyar la **detección de datos sospechosos** durante el control de
+    calidad de una serie;
+-   servir de **modelo exploratorio** antes de pasar a métodos más
+    complejos.
+
 ## ¿Cómo elige la pregunta? Impureza
 
 El algoritmo busca, entre todas las variables y todos los posibles
@@ -530,6 +549,29 @@ viento débil. Con solo cuatro hojas se alcanza una exactitud cercana a
 **simplicidad tiene un costo** en desempeño que hay que decidir si vale la
 pena pagar.
 
+## Ventajas y desventajas de los árboles de decisión
+
+| Ventajas                                                  | Desventajas                                                                      |
+|-----------------------------------------------------------|----------------------------------------------------------------------------------|
+| Construcción barata y rápida                              | Fácil de sobreajustar                                                            |
+| Rápido para clasificar registros nuevos                   | Muy sensible a cambios en el conjunto de entrenamiento (alta varianza)           |
+| Fácil de interpretar, si el árbol es pequeño              | Difícil de interpretar, si el árbol es grande                                    |
+| Excluye por sí mismo las variables sin importancia        | Tiende a favorecer las divisiones por variables con muchos valores distintos     |
+| No exige escalar ni normalizar las variables              | Genera divisiones por umbrales, por lo que representa relaciones suaves de forma escalonada |
+
+Hemos visto estas desventajas con los propios datos: el árbol grande
+sobreajustó, y la poda lo corrigió. La alta varianza (pequeños cambios en
+los datos producen árboles muy distintos) es precisamente el problema que
+resuelven los bosques aleatorios.
+
+Algunas variantes que se pueden probar para mejorar un árbol son:
+
+-   **podarlo** (lo que hicimos);
+-   fijar una **profundidad máxima** (`maxdepth`), una cantidad mínima de
+    observaciones por hoja o una cantidad máxima de variables;
+-   usar **bagging**;
+-   usar **bosques de árboles** (la siguiente sección).
+
 ------------------------------------------------------------------------
 
 
@@ -597,6 +639,28 @@ decisión.
 ------------------------------------------------------------------------
 
 # Random Forest
+
+## Antes del bagging: el bootstrap
+
+El **bootstrap** es un método de remuestreo. Sirve para estudiar cuánto
+varía un estadístico $T(x)$ (la media, una mediana, un coeficiente) cuando
+solo se dispone de una muestra de tamaño $n$. El procedimiento es:
+
+1.  Tomar $n$ observaciones **con reemplazo** de la muestra original (una
+    misma observación puede repetirse y otras quedar fuera).
+2.  Calcular el estadístico $T(x)$ con esa muestra.
+3.  Repetir los pasos 1 y 2 un total de $B$ veces.
+
+Se obtienen así $B$ valores del estadístico. Su dispersión simula la
+distribución del estadístico y permite, por ejemplo, estimar su
+variabilidad sin supuestos sobre la distribución de los datos.
+
+La idea del **bagging** (*bootstrap aggregation*) es aplicar lo mismo a un
+**modelo supervisado**: en lugar de calcular un estadístico, se ajusta un
+modelo a cada muestra bootstrap, y luego se **agregan** las predicciones
+(promedio en regresión, clase más votada en clasificación). Como un árbol
+individual tiene alta varianza, promediar muchos árboles entrenados con
+muestras distintas **reduce la varianza** de la predicción final.
 
 ## Idea: muchos árboles distintos votan
 
@@ -827,6 +891,26 @@ t(sapply(umbrales, function(u) {
 (sube la sensibilidad) a costa de más falsas alarmas (baja la precisión).
 Al **subirlo** ocurre lo contrario. No existe un umbral "correcto": se
 elige según el uso del pronóstico.
+
+## ¿Árbol o Random Forest? Cuándo usar cada uno
+
+No existe un método "mejor" en todos los casos. La elección depende del uso
+que se le dará al modelo:
+
+| Criterio                                        | Árbol de decisión (podado)        | Random Forest                         |
+|-------------------------------------------------|-----------------------------------|---------------------------------------|
+| Necesito **explicar cada decisión** (informe regulatorio, audiencia no técnica) | Adecuado: se lee como un diagrama o como reglas | Poco adecuado: es una "caja negra"    |
+| La **precisión** es la prioridad                | Menor desempeño y más inestable   | Adecuado: suele ser más preciso y estable |
+| Muchas variables de entrada                     | Funciona, pero es sensible        | Adecuado: maneja muchas variables     |
+| Necesito saber qué variables importan           | Se ve en las preguntas del árbol  | Importancia por permutación           |
+| Prototipo rápido o modelo exploratorio          | Adecuado                          | Más lento de entrenar                 |
+| Predicción de **valores extremos** (regresión)  | Limitado: promedia en cada hoja   | Limitado: también encoge hacia el promedio (véase la sección de regresión) |
+
+Los bosques también se pueden usar en otros problemas, como *clustering* y
+detección de anomalías, a partir de las proximidades entre observaciones,
+aunque no los trabajaremos en este curso. Una combinación habitual en la
+práctica es usar un **árbol pequeño para comunicar y entender** el
+fenómeno, y un **Random Forest para predecir**.
 
 ------------------------------------------------------------------------
 
